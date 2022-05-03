@@ -23,16 +23,14 @@
 #include <condition_variable>
 
 std::unordered_map<int,int> gGoList;
-std::unordered_map<int,int> gbackList;
+std::unordered_map<int,int> gFdMaps;
 std::mutex gMutex;
 std::mutex gDataMutex;
 std::condition_variable gWaiter;
-
 bool gRunning = true;
 
-void listenThreadFunc(int fd,std::string serverAddr,short serverPort);
-void transmitListenToDest();
-void transmitDestToListen();
+void listenThreadFunc(int listenfd,std::string serverAddr,short serverPort);
+void fordThreadFunc();
 void signalHandler(int sig);
 void switchLoglevel(std::string level);
 
@@ -53,30 +51,35 @@ int main(int argc,char** argv)
         spdlog::error("error({}):{}",errno,strerror(errno));
         return -1;
     }
+    spdlog::info("start forward 0.0.0.0:{} to {}:{}",args.get<short>("listen"),args.get<std::string>("destip"),args.get<short>("destport"));
     std::thread listenThread(listenThreadFunc,listenfd,args.get<std::string>("destip"),args.get<short>("destport"));
-    std::thread transmitThread(transmitListenToDest);
-    std::thread transmitThread2(transmitDestToListen);
+    std::thread forwardThread(fordThreadFunc);
     gRunning = true;
+
+    signal(SIGINT,signalHandler);
+    signal(SIGTERM,signalHandler);
+
     while (gRunning)
     {
         std::unique_lock<std::mutex> lock(gMutex);
         gWaiter.wait(lock);
     }
+
+    shutdown(listenfd,SHUT_RDWR);
     close(listenfd);
     listenThread.join();
-    transmitThread.join();
-    transmitThread2.join();
+    forwardThread.join();
     return 0;
 }
 
-void listenThreadFunc(int fd,std::string serverAddr,short serverPort)
+void listenThreadFunc(int listenfd,std::string serverAddr,short serverPort)
 {
     while (gRunning)
     {
         struct sockaddr_in socketClientAddr;
         socklen_t clientLen = sizeof(struct sockaddr);
-        int clientFd = accept(fd,(struct sockaddr *)&socketClientAddr, &clientLen);
-        if(clientFd > 0)
+        int clientFd = accept(listenfd,(struct sockaddr *)&socketClientAddr, &clientLen);
+        if(clientFd >= 0)
         {
             char clientaddress[20] = {0};
             spdlog::debug("new request from {}:{}",inet_ntop(AF_INET,(void*)&socketClientAddr.sin_addr,clientaddress,clientLen),ntohs(socketClientAddr.sin_port));
@@ -84,14 +87,26 @@ void listenThreadFunc(int fd,std::string serverAddr,short serverPort)
             if(serverfd > 0)
             {
                 std::unique_lock<std::mutex> _l(gDataMutex);
-                gGoList[clientFd] = serverfd;
-                gbackList[serverfd] = clientFd;
+                gFdMaps[serverfd] = clientFd;
             }
+            else
+            {
+                // if open dest addr failed. close request
+                close(clientFd);
+            }
+        }
+        else
+        {
+            spdlog::error("error with({}): {}",errno,strerror(errno));
+            gRunning = false;
+            gWaiter.notify_one();
+            break;
         }
     }
     
 }
-void transmitListenToDest()
+
+void fordThreadFunc()
 {
     char* buffer = nullptr;
     size_t buffersize = 0;
@@ -99,16 +114,17 @@ void transmitListenToDest()
     fd_set sets;
     while(gRunning)
     {
-        timeout.tv_sec = 5;
+        timeout.tv_sec = 1;
         timeout.tv_usec = 0;
         {
             std::unique_lock<std::mutex> _l(gDataMutex);
-            auto iter = gGoList.begin();
-            while (iter != gGoList.end())
+            auto iter = gFdMaps.begin();
+            while (iter != gFdMaps.end())
             {
                 if (iter->first > 0 && iter->second > 0)
                 {
                     FD_SET(iter->first, &sets);
+                    FD_SET(iter->second,&sets);
                 }
                 iter++;
             }
@@ -122,104 +138,67 @@ void transmitListenToDest()
         if(ret > 0)
         {
             std::unique_lock<std::mutex> _l(gDataMutex);
-            auto iter = gGoList.begin();
-            while (iter != gGoList.end())
-            {
-                if (FD_ISSET(iter->first,&sets) && iter->first > 0 && iter->second > 0)
-                {
-                    int nNeedRead = 0;
-                    ioctl(iter->first,FIONREAD,&nNeedRead);
-                    if(nNeedRead>0)
-                    {
-                        if(nNeedRead > buffersize)
-                        {
-                            buffer = (char*)realloc(buffer,nNeedRead);
-                            buffersize = nNeedRead;
-                        }
-                        int recvLen = recv(iter->first,buffer,nNeedRead,0);
-                        if(recvLen > 0)
-                        {
-                            int sendLen = send(iter->second,buffer,recvLen,0);
-                            spdlog::trace("transmit {} from listened port to destnination addr",sendLen);
-                        }
-                        else
-                        {
-                            close(iter->first);
-                            close(iter->second);
-                            iter->second = 0;
-                        }
-                    }
-                }
-                iter++;
-            }
-        }
-    }
-    if(buffersize>0 && buffer!=nullptr)
-    {
-        free(buffer);
-        buffer = nullptr;
-        buffersize = 0;
-    }
-}
-
-void transmitDestToListen()
-{
-    char* buffer = nullptr;
-    size_t buffersize = 0;
-    struct timeval timeout;
-    fd_set sets;
-    while(gRunning)
-    {
-        timeout.tv_sec = 5;
-        timeout.tv_usec = 0;
-        {
-            std::unique_lock<std::mutex> _l(gDataMutex);
-            auto iter = gbackList.begin();
-            while (iter != gbackList.end())
+            auto iter = gFdMaps.begin();
+            while (iter != gFdMaps.end())
             {
                 if (iter->first > 0 && iter->second > 0)
                 {
-                    FD_SET(iter->first, &sets);
-                }
-                iter++;
-            }
-        }
-
-        int ret = select(FD_SETSIZE+1,&sets,NULL,NULL,&timeout);
-        if(!gRunning)
-        {
-            break;
-        }
-        if(ret > 0)
-        {
-            std::unique_lock<std::mutex> _l(gDataMutex);
-            auto iter = gbackList.begin();
-            while (iter != gbackList.end())
-            {
-                if (FD_ISSET(iter->first,&sets) && iter->first > 0 && iter->second > 0)
-                {
                     int nNeedRead = 0;
-                    ioctl(iter->first,FIONREAD,&nNeedRead);
-                    if(nNeedRead>0)
+                    if(FD_ISSET(iter->first,&sets))
                     {
-                        if(nNeedRead > buffersize)
+                        ioctl(iter->first, FIONREAD, &nNeedRead);
+                        if (nNeedRead > 0)
                         {
-                            buffer = (char*)realloc(buffer,nNeedRead);
-                            buffersize = nNeedRead;
-                        }
-                        int recvLen = recv(iter->first,buffer,nNeedRead,0);
-                        if(recvLen > 0)
-                        {
-                            int sendLen = send(iter->second,buffer,recvLen,0);
-                            spdlog::trace("transmit {} from destnination addr to listened port",sendLen);
-                        }
-                        else
-                        {
-                            close(iter->first);
-                            close(iter->second);
-                            iter->second = 0;
+                            if (nNeedRead > buffersize)
+                            {
+                                buffer = (char *)realloc(buffer, nNeedRead);
+                                buffersize = nNeedRead;
+                            }
+                            int recvLen = recv(iter->first, buffer, nNeedRead, 0);
+                            if (recvLen > 0)
+                            {
+                                int sendLen = send(iter->second, buffer, recvLen, 0);
+                                spdlog::trace("transmit {} from destnination addr to listened port", sendLen);
+                            }
+                            else
+                            {
+                                close(iter->first);
+                                close(iter->second);
+                                iter->second = 0;
+                            }
                         }
                     }
+                    if(iter->second >0 && FD_ISSET(iter->second,&sets))
+                    {
+                        ioctl(iter->second, FIONREAD, &nNeedRead);
+                        if (nNeedRead > 0)
+                        {
+                            if (nNeedRead > buffersize)
+                            {
+                                buffer = (char *)realloc(buffer, nNeedRead);
+                                buffersize = nNeedRead;
+                            }
+                            int recvLen = recv(iter->second, buffer, nNeedRead, 0);
+                            if (recvLen > 0)
+                            {
+                                int sendLen = send(iter->first, buffer, recvLen, 0);
+                                spdlog::trace("transmit {} from listen port to destination", sendLen);
+                            }
+                            else
+                            {
+                                close(iter->first);
+                                close(iter->second);
+                                iter->second = 0;
+                            }
+                        }
+                    }
+                }
+                if (iter->first == 0 || iter->second == 0)
+                {
+                    close(iter->first);
+                    close(iter->second);
+                    iter = gFdMaps.erase(iter);
+                    continue;
                 }
                 iter++;
             }
@@ -230,16 +209,34 @@ void transmitDestToListen()
         free(buffer);
         buffer = nullptr;
         buffersize = 0;
+    }
+    if(!gRunning)
+    {
+        auto iter = gFdMaps.begin();
+        while(iter != gFdMaps.end())
+        {
+            if(iter->first > 0)
+            {
+                shutdown(iter->first,SHUT_RDWR);
+                close(iter->first);
+            }
+            if(iter->second > 0)
+            {
+                shutdown(iter->second,SHUT_RDWR);
+                close(iter->second);
+            }
+            iter++;
+        }
     }
 }
 
 void signalHandler(int sig)
 {
+    gRunning = false;
     spdlog::info("interrupt by sig {}",sig);
     std::lock_guard<std::mutex> _l(gMutex);
-    gWaiter.notify_one();
+    gWaiter.notify_all();
 }
-
 
 void switchLoglevel(std::string level)
 {
